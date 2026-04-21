@@ -45,18 +45,26 @@ You have a few straightforward options. Do **one** of the following:
 
 * **Default**: mainnet
 * **Testnet-10**: pass `--net tn10` or `--net testnet10`
+* **Devnet**: pass `--net devnet`
 
 The script uses these default gRPC endpoints:
 
 * Mainnet: `grpc://n-mainnet.kaspa.ws:16110`
 * Testnet-10: `grpc://n-testnet-10.kaspa.ws:16210`
+* Devnet: `grpc://127.0.0.1:16610`
 
 Your address prefix must match the network:
 
 * `kaspa:` for mainnet
 * `kaspatest:` for testnet
+* `kaspadev:` for devnet
 
 If they do not match, the script will stop with a clear error.
+
+For custom devnets, two extra runtime overrides are useful:
+
+* `--rpc-url <grpc://host:port>` to target a non-default devnet RPC endpoint
+* `--coinbase-maturity <daa-score>` when your devnet blockrate override changes the effective maturity window
 
 ---
 
@@ -100,7 +108,21 @@ If they do not match, the script will stop with a clear error.
    cargo run --release --bin Tx_gen -- --net tn10
    ```
 
-6. **Run on mainnet** (only if you know what you are doing)
+6. **Run on devnet**
+
+   ```bash
+   cargo run --release --bin Tx_gen -- --net devnet
+   ```
+
+   For custom devnets, you will usually also want an explicit maturity override:
+
+   ```bash
+   cargo run --release --bin Tx_gen -- --net devnet --coinbase-maturity 2000
+   ```
+
+   If the node is not on the same host, also pass `--rpc-url`.
+
+7. **Run on mainnet** (only if you know what you are doing)
 
    ```bash
    cargo run --release --bin Tx_gen
@@ -160,7 +182,7 @@ You can raise fee rates if your node rejects for size or fee reasons.
    It pulls confirmed, spendable UTXOs for your address, applying a simple maturity rule:
 
    * Non-coinbase: needs 10 confirmations
-   * Coinbase: needs `coinbase_maturity` (default 100)
+   * Coinbase: needs `coinbase_maturity` (default 100, override with `--coinbase-maturity` for custom devnets)
 
 3. **Split if needed**
    If you have fewer than `TARGET_UTXO_COUNT`, it:
@@ -198,7 +220,6 @@ You can raise fee rates if your node rejects for size or fee reasons.
 * Built on the `rusty-kaspa` stack.
 
 ---
-
 
 
 

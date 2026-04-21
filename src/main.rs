@@ -4,21 +4,24 @@ use kaspa_consensus_core::{
     sign::sign,
     subnets::SUBNETWORK_ID_NATIVE,
     tx::{
-        MutableTransaction, Transaction, TransactionInput, TransactionOutput,
-        TransactionOutpoint, UtxoEntry as CoreUtxoEntry,
+        MutableTransaction, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput,
+        UtxoEntry as CoreUtxoEntry,
     },
 };
 use kaspa_grpc_client::GrpcClient;
 use kaspa_rpc_core::{
     api::rpc::RpcApi,
-    model::{GetServerInfoRequest, GetUtxosByAddressesRequest, RpcUtxoEntry, SubmitTransactionRequest, GetServerInfoResponse},
+    model::{
+        GetServerInfoRequest, GetServerInfoResponse, GetUtxosByAddressesRequest, RpcUtxoEntry,
+        SubmitTransactionRequest,
+    },
     RpcTransaction,
 };
 use kaspa_txscript::pay_to_address_script;
 use secp256k1::{Keypair, SecretKey, SECP256K1};
 use std::{
-    env,
     collections::{HashMap, HashSet},
+    env,
     str::FromStr,
     sync::Arc,
     time::Instant,
@@ -31,7 +34,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use rayon::prelude::*;
 
 // ----------------------- tunables -----------------------
-const PRIVATE_KEY_HEX: &str = "ENTER PRIVATE KEY"; 
+const PRIVATE_KEY_HEX: &str = "ENTER PRIVATE KEY";
 const TARGET_UTXO_COUNT: usize = 100;
 const AMOUNT_PER_UTXO: u64 = 150_000_000; // 1.5 KAS
 const OUTPUTS_PER_TRANSACTION: usize = 10;
@@ -39,11 +42,11 @@ const TRANSACTIONS_COUNT: usize =
     (TARGET_UTXO_COUNT + OUTPUTS_PER_TRANSACTION - 1) / OUTPUTS_PER_TRANSACTION;
 const SPAM_DURATION_SECONDS: u64 = 86_400; // 0 means run forever
 
-const TARGET_TPS: u64 = 50;      // 1 UTXO = 0.25-0.33 TPS, set TPS to UTXO_COUNT / 2
-const UNLEASHED: bool = true;    // false keeps safety cap at 100 TPS
-const MILLIS_PER_TICK: u64 = 10;  // 10 ms tick for smooth pacing
+const TARGET_TPS: u64 = 50; // 1 UTXO = 0.25-0.33 TPS, set TPS to UTXO_COUNT / 2
+const UNLEASHED: bool = true; // false keeps safety cap at 100 TPS
+const MILLIS_PER_TICK: u64 = 10; // 10 ms tick for smooth pacing
 
-const BASE_FEE_RATE: u64 = 1;     // 1 sompi/gram
+const BASE_FEE_RATE: u64 = 1; // 1 sompi/gram
 const CLIENT_POOL_SIZE: usize = 8; // gRPC connections
 const UTXO_REFRESH_SECS: u64 = 1;
 const MIN_CHANGE_SOMPI: u64 = 1_000_000; // 0.01 KAS
@@ -67,11 +70,12 @@ pub const fn required_fee_splitting(num_inputs: usize, num_outputs: u64) -> u64 
 enum Net {
     Mainnet,
     Testnet10,
+    Devnet,
 }
 
 impl Net {
     fn from_args() -> Self {
-        // supports: --net tn10 | --net testnet10 | --net=tn10 | --net=testnet10
+        // supports: --net tn10 | --net testnet10 | --net devnet | --net=tn10 | --net=testnet10 | --net=devnet
         let mut net = Net::Mainnet;
         let mut it = env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -79,11 +83,15 @@ impl Net {
                 if let Some(v) = it.next() {
                     if v.eq_ignore_ascii_case("tn10") || v.eq_ignore_ascii_case("testnet10") {
                         net = Net::Testnet10;
+                    } else if v.eq_ignore_ascii_case("devnet") {
+                        net = Net::Devnet;
                     }
                 }
             } else if let Some(v) = arg.strip_prefix("--net=") {
                 if v.eq_ignore_ascii_case("tn10") || v.eq_ignore_ascii_case("testnet10") {
                     net = Net::Testnet10;
+                } else if v.eq_ignore_ascii_case("devnet") {
+                    net = Net::Devnet;
                 }
             }
         }
@@ -92,24 +100,50 @@ impl Net {
 
     fn grpc_url(self) -> String {
         match self {
-            Net::Mainnet   => "grpc://n-mainnet.kaspa.ws:16110".to_string(),
+            Net::Mainnet => "grpc://n-mainnet.kaspa.ws:16110".to_string(),
             Net::Testnet10 => "grpc://n-testnet-10.kaspa.ws:16210".to_string(),
+            Net::Devnet => "grpc://127.0.0.1:16610".to_string(),
         }
     }
 
     fn prefix(self) -> Prefix {
         match self {
-            Net::Mainnet   => Prefix::Mainnet,
+            Net::Mainnet => Prefix::Mainnet,
             Net::Testnet10 => Prefix::Testnet, // testnet addresses use "kaspatest:"
+            Net::Devnet => Prefix::Devnet,
         }
     }
 
     fn expected_hint(self) -> &'static str {
         match self {
-            Net::Mainnet   => "mainnet",
+            Net::Mainnet => "mainnet",
             Net::Testnet10 => "testnet-10",
+            Net::Devnet => "devnet",
         }
     }
+
+    fn default_coinbase_maturity(self) -> u64 {
+        match self {
+            Net::Mainnet | Net::Testnet10 | Net::Devnet => 100,
+        }
+    }
+}
+
+fn arg_value(flag: &str) -> Option<String> {
+    let mut it = env::args().skip(1);
+    while let Some(arg) = it.next() {
+        if arg == flag {
+            return it.next();
+        }
+        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn arg_u64(flag: &str) -> Option<u64> {
+    arg_value(flag).and_then(|value| value.parse::<u64>().ok())
 }
 
 fn assert_network_matches(
@@ -118,8 +152,11 @@ fn assert_network_matches(
     addr: &Address,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Address prefix must match selected net
-    match (net, addr.prefix) { // prefix is a field, not a method
-        (Net::Mainnet, Prefix::Mainnet) | (Net::Testnet10, Prefix::Testnet) => {}
+    match (net, addr.prefix) {
+        // prefix is a field, not a method
+        (Net::Mainnet, Prefix::Mainnet)
+        | (Net::Testnet10, Prefix::Testnet)
+        | (Net::Devnet, Prefix::Devnet) => {}
         _ => return Err("Address prefix does not match selected network".into()),
     }
 
@@ -135,8 +172,9 @@ fn assert_network_matches(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let net = Net::from_args();
-    let rpc_url = net.grpc_url();
-
+    let rpc_url = arg_value("--rpc-url").unwrap_or_else(|| net.grpc_url());
+    let coinbase_maturity =
+        arg_u64("--coinbase-maturity").unwrap_or_else(|| net.default_coinbase_maturity());
 
     // connection pool
     let mut clients: Vec<Arc<GrpcClient>> = Vec::with_capacity(CLIENT_POOL_SIZE);
@@ -151,13 +189,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kaspa_addresses::Version::PubKey,
         &keypair.x_only_public_key().0.serialize(),
     );
-    let si = clients[0].get_server_info_call(None, GetServerInfoRequest {}).await?;
+    let si = clients[0]
+        .get_server_info_call(None, GetServerInfoRequest {})
+        .await?;
     assert_network_matches(&si, net, &address)?;
-    
 
     println!("=== UTXO Analysis ===");
     #[allow(unused_mut)]
-    let mut utxos = fetch_spendable_utxos(&clients[0], address.clone(), 100).await?;
+    let mut utxos = fetch_spendable_utxos(&clients[0], address.clone(), coinbase_maturity).await?;
     let current_utxo_count = utxos.len();
     let total_balance: u64 = utxos.iter().map(|(_, entry)| entry.amount).sum();
     println!("Current UTXOs: {}", current_utxo_count);
@@ -165,7 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if current_utxo_count < TARGET_UTXO_COUNT {
         println!("=== Phase 1: UTXO Splitting ===");
-        println!("Need to create {} more UTXOs", TARGET_UTXO_COUNT - current_utxo_count);
+        println!(
+            "Need to create {} more UTXOs",
+            TARGET_UTXO_COUNT - current_utxo_count
+        );
 
         let largest_utxo = utxos.iter().max_by_key(|(_, e)| e.amount).unwrap().clone();
         let kas_amount = largest_utxo.1.amount / 100_000_000;
@@ -187,7 +229,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let total_output_value = AMOUNT_PER_UTXO * outputs_this_tx as u64;
             let estimated_fee = required_fee_splitting(1, outputs_this_tx as u64 + 1);
-            let change_value = current_utxo.1.amount.saturating_sub(total_output_value + estimated_fee);
+            let change_value = current_utxo
+                .1
+                .amount
+                .saturating_sub(total_output_value + estimated_fee);
 
             if change_value < MIN_CHANGE_SOMPI && i < TRANSACTIONS_COUNT - 1 {
                 println!("Insufficient funds for change in tx {}, stopping", i + 1);
@@ -203,12 +248,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &address,
             )?;
 
-            println!("Submitting splitting transaction {} with {} outputs", i + 1, outputs_this_tx);
+            println!(
+                "Submitting splitting transaction {} with {} outputs",
+                i + 1,
+                outputs_this_tx
+            );
             clients[0]
-                .submit_transaction_call(None, SubmitTransactionRequest {
-                    transaction: RpcTransaction::from(&tx),
-                    allow_orphan: true,
-                })
+                .submit_transaction_call(
+                    None,
+                    SubmitTransactionRequest {
+                        transaction: RpcTransaction::from(&tx),
+                        allow_orphan: true,
+                    },
+                )
                 .await?;
 
             created += 1;
@@ -227,7 +279,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sleep(Duration::from_millis(200)).await;
         }
 
-        println!("Created {} splitting transactions, waiting for confirmations...", created);
+        println!(
+            "Created {} splitting transactions, waiting for confirmations...",
+            created
+        );
         sleep(Duration::from_secs(10)).await;
     } else {
         println!(
@@ -237,7 +292,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("=== Phase 2: Transaction Spam ===");
-    spam_transactions(&clients, address, keypair, TARGET_TPS, SPAM_DURATION_SECONDS).await?;
+    spam_transactions(
+        &clients,
+        address,
+        keypair,
+        TARGET_TPS,
+        SPAM_DURATION_SECONDS,
+        coinbase_maturity,
+    )
+    .await?;
     Ok(())
 }
 
@@ -248,13 +311,14 @@ async fn spam_transactions(
     keypair: Keypair,
     target_tps: u64,
     duration_seconds: u64,
+    coinbase_maturity: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client0 = clients[0].clone();
     let tps_tx = spawn_tps_logger();
 
     // UTXO state
     let mut pending: HashMap<TransactionOutpoint, Instant> = HashMap::new(); // in-flight or waiting confirm
-    let mut spent: HashSet<TransactionOutpoint> = HashSet::new();            // successfully accepted by node (may still be unconfirmed)
+    let mut spent: HashSet<TransactionOutpoint> = HashSet::new(); // successfully accepted by node (may still be unconfirmed)
 
     // pacing & stats
     let mut stats_start = Instant::now();
@@ -262,7 +326,11 @@ async fn spam_transactions(
     let start = Instant::now();
 
     // safety cap (flip UNLEASHED to true once you verify)
-    let effective_tps = if UNLEASHED { target_tps } else { target_tps.min(100) };
+    let effective_tps = if UNLEASHED {
+        target_tps
+    } else {
+        target_tps.min(100)
+    };
 
     let mut ticker = interval(Duration::from_millis(MILLIS_PER_TICK));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -270,14 +338,15 @@ async fn spam_transactions(
     stats_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // initial UTXOs
-    let coinbase_maturity = 100u64;
     let mut utxos = fetch_spendable_utxos(&client0, address.clone(), coinbase_maturity).await?;
     let mut last_refresh = Instant::now();
     let mut idx = 0usize;
 
     println!(
         "Starting spam at {} TPS ({} ms tick). Initial UTXOs: {}",
-        effective_tps, MILLIS_PER_TICK, utxos.len()
+        effective_tps,
+        MILLIS_PER_TICK,
+        utxos.len()
     );
 
     // fractional pacing: e.g., 200 TPS at 10 ms => 2.0 tx/tick
@@ -443,7 +512,13 @@ fn create_splitting_transaction(
     }
 
     let unsigned_tx = Transaction::new(
-        TX_VERSION, inputs, outputs, 0, SUBNETWORK_ID_NATIVE, 0, vec![],
+        TX_VERSION,
+        inputs,
+        outputs,
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
     );
 
     let signed_tx = sign(
@@ -476,7 +551,13 @@ fn create_spam_transaction(
     }];
 
     let unsigned_tx = Transaction::new(
-        TX_VERSION, inputs, outputs, 0, SUBNETWORK_ID_NATIVE, 0, vec![],
+        TX_VERSION,
+        inputs,
+        outputs,
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
     );
 
     let signed_tx = sign(
@@ -494,9 +575,16 @@ async fn fetch_spendable_utxos(
     coinbase_maturity: u64,
 ) -> Result<Vec<(TransactionOutpoint, CoreUtxoEntry)>, Box<dyn std::error::Error>> {
     let resp = client
-        .get_utxos_by_addresses_call(None, GetUtxosByAddressesRequest { addresses: vec![address.clone()] })
+        .get_utxos_by_addresses_call(
+            None,
+            GetUtxosByAddressesRequest {
+                addresses: vec![address.clone()],
+            },
+        )
         .await?;
-    let server_info = client.get_server_info_call(None, GetServerInfoRequest {}).await?;
+    let server_info = client
+        .get_server_info_call(None, GetServerInfoRequest {})
+        .await?;
     let virtual_daa_score = server_info.virtual_daa_score;
 
     let mut utxos = Vec::with_capacity(resp.entries.len());
@@ -518,7 +606,11 @@ async fn fetch_spendable_utxos(
 }
 
 fn is_utxo_spendable(entry: &RpcUtxoEntry, virtual_daa_score: u64, coinbase_maturity: u64) -> bool {
-    let needed_confirmations = if !entry.is_coinbase { 10 } else { coinbase_maturity };
+    let needed_confirmations = if !entry.is_coinbase {
+        10
+    } else {
+        coinbase_maturity
+    };
     entry.block_daa_score + needed_confirmations <= virtual_daa_score
 }
 
@@ -529,7 +621,8 @@ fn spawn_tps_logger() -> UnboundedSender<u32> {
     tokio::spawn(async move {
         let mut per_sec: u64 = 0;
         let mut total: u64 = 0;
-        let mut last10: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(10);
+        let mut last10: std::collections::VecDeque<u64> =
+            std::collections::VecDeque::with_capacity(10);
         let mut tick = interval(Duration::from_secs(1));
 
         loop {
@@ -553,6 +646,3 @@ fn spawn_tps_logger() -> UnboundedSender<u32> {
 
     tx
 }
-
-
-
