@@ -124,7 +124,7 @@ impl Net {
 
     fn default_coinbase_maturity(self) -> u64 {
         match self {
-            Net::Mainnet | Net::Testnet10 | Net::Devnet => 100,
+            Net::Mainnet | Net::Testnet10 | Net::Devnet => 1000,
         }
     }
 }

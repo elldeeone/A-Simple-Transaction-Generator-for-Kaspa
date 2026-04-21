@@ -66,6 +66,8 @@ For custom devnets, two extra runtime overrides are useful:
 * `--rpc-url <grpc://host:port>` to target a non-default devnet RPC endpoint
 * `--coinbase-maturity <daa-score>` when your devnet blockrate override changes the effective maturity window
 
+On current stock networks, mainnet, testnet-10, and devnet all run at 10 BPS, so the default coinbase maturity is `1000` DAA.
+
 ---
 
 ## Quick start
@@ -182,7 +184,7 @@ You can raise fee rates if your node rejects for size or fee reasons.
    It pulls confirmed, spendable UTXOs for your address, applying a simple maturity rule:
 
    * Non-coinbase: needs 10 confirmations
-   * Coinbase: needs `coinbase_maturity` (default 100, override with `--coinbase-maturity` for custom devnets)
+   * Coinbase: needs `coinbase_maturity` (default `1000` on stock mainnet, testnet-10, and devnet; override with `--coinbase-maturity` for custom devnets)
 
 3. **Split if needed**
    If you have fewer than `TARGET_UTXO_COUNT`, it:
@@ -220,6 +222,5 @@ You can raise fee rates if your node rejects for size or fee reasons.
 * Built on the `rusty-kaspa` stack.
 
 ---
-
 
 
