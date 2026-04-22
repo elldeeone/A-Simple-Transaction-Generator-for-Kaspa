@@ -15,6 +15,7 @@ use kaspa_rpc_core::{
         GetServerInfoRequest, GetServerInfoResponse, GetUtxosByAddressesRequest, RpcUtxoEntry,
         SubmitTransactionRequest,
     },
+    notify::mode::NotificationMode,
     RpcTransaction,
 };
 use kaspa_txscript::pay_to_address_script;
@@ -49,6 +50,8 @@ const MILLIS_PER_TICK: u64 = 10; // 10 ms tick for smooth pacing
 const BASE_FEE_RATE: u64 = 1; // 1 sompi/gram
 const CLIENT_POOL_SIZE: usize = 8; // gRPC connections
 const UTXO_REFRESH_SECS: u64 = 1;
+const DEFAULT_RPC_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_STARTUP_RPC_TIMEOUT_MS: u64 = DEFAULT_RPC_TIMEOUT_MS;
 const MIN_CHANGE_SOMPI: u64 = 1_000_000; // 0.01 KAS
 const MAX_PENDING_AGE_SECS: u64 = 3600;
 
@@ -173,13 +176,49 @@ fn assert_network_matches(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let net = Net::from_args();
     let rpc_url = arg_value("--rpc-url").unwrap_or_else(|| net.grpc_url());
+    let rpc_timeout_ms = arg_u64("--rpc-timeout-ms").unwrap_or(DEFAULT_RPC_TIMEOUT_MS);
+    let startup_rpc_timeout_ms = arg_u64("--startup-rpc-timeout-ms")
+        .unwrap_or(DEFAULT_STARTUP_RPC_TIMEOUT_MS.max(rpc_timeout_ms));
     let coinbase_maturity =
         arg_u64("--coinbase-maturity").unwrap_or_else(|| net.default_coinbase_maturity());
 
-    // connection pool
+    if rpc_timeout_ms == 0 {
+        return Err("--rpc-timeout-ms must be greater than 0".into());
+    }
+    if startup_rpc_timeout_ms == 0 {
+        return Err("--startup-rpc-timeout-ms must be greater than 0".into());
+    }
+
+    let startup_client = Arc::new(
+        GrpcClient::connect_with_args(
+            NotificationMode::Direct,
+            rpc_url.clone(),
+            None,
+            false,
+            None,
+            false,
+            Some(startup_rpc_timeout_ms),
+            Default::default(),
+        )
+        .await?,
+    );
+
+    // runtime connection pool
     let mut clients: Vec<Arc<GrpcClient>> = Vec::with_capacity(CLIENT_POOL_SIZE);
     for _ in 0..CLIENT_POOL_SIZE {
-        clients.push(Arc::new(GrpcClient::connect(rpc_url.clone()).await?));
+        clients.push(Arc::new(
+            GrpcClient::connect_with_args(
+                NotificationMode::Direct,
+                rpc_url.clone(),
+                None,
+                false,
+                None,
+                false,
+                Some(rpc_timeout_ms),
+                Default::default(),
+            )
+            .await?,
+        ));
     }
 
     let secret_key = SecretKey::from_str(PRIVATE_KEY_HEX)?;
@@ -189,14 +228,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kaspa_addresses::Version::PubKey,
         &keypair.x_only_public_key().0.serialize(),
     );
-    let si = clients[0]
+    let runtime_client = clients[0].clone();
+
+    let si = startup_client
         .get_server_info_call(None, GetServerInfoRequest {})
         .await?;
     assert_network_matches(&si, net, &address)?;
 
+    println!("=== tx-gen config ===");
+    println!("rpc: {}", rpc_url);
+    println!("rpc timeout: {}ms", rpc_timeout_ms);
+    println!("startup rpc timeout: {}ms", startup_rpc_timeout_ms);
+    println!("address: {}", address);
+
     println!("=== UTXO Analysis ===");
     #[allow(unused_mut)]
-    let mut utxos = fetch_spendable_utxos(&clients[0], address.clone(), coinbase_maturity).await?;
+    let mut utxos =
+        fetch_spendable_utxos(&startup_client, address.clone(), coinbase_maturity).await?;
     let current_utxo_count = utxos.len();
     let total_balance: u64 = utxos.iter().map(|(_, entry)| entry.amount).sum();
     println!("Current UTXOs: {}", current_utxo_count);
@@ -253,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i + 1,
                 outputs_this_tx
             );
-            clients[0]
+            startup_client
                 .submit_transaction_call(
                     None,
                     SubmitTransactionRequest {
@@ -293,6 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== Phase 2: Transaction Spam ===");
     spam_transactions(
+        &runtime_client,
         &clients,
         address,
         keypair,
@@ -306,6 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ----------------------- spam loop -----------------------
 async fn spam_transactions(
+    runtime_client: &Arc<GrpcClient>,
     clients: &[Arc<GrpcClient>],
     address: Address,
     keypair: Keypair,
@@ -313,7 +363,7 @@ async fn spam_transactions(
     duration_seconds: u64,
     coinbase_maturity: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client0 = clients[0].clone();
+    let client0 = runtime_client.clone();
     let tps_tx = spawn_tps_logger();
 
     // UTXO state
@@ -354,8 +404,9 @@ async fn spam_transactions(
     let mut carry: f64 = 0.0;
 
     // persistent inflight submit queue (don’t block the tick)
-    let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
     const MAX_INFLIGHT: usize = 20_000; // keep a leash on concurrent submits
+    let refresh_low_watermark = TARGET_UTXO_COUNT.saturating_mul(2).max(MAX_INFLIGHT / 4);
+    let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut rr = 0usize; // round-robin across client pool
 
     // reuse keypair cheaply
@@ -371,7 +422,12 @@ async fn spam_transactions(
                 }
 
                 // refresh UTXOs periodically or when running low
-                if last_refresh.elapsed().as_secs() >= UTXO_REFRESH_SECS || idx >= utxos.len().saturating_sub(8) {
+                let ready_left = utxos.len().saturating_sub(idx);
+                let local_runway = ready_left.saturating_add(pending.len());
+                if idx >= utxos.len().saturating_sub(8)
+                    || (last_refresh.elapsed().as_secs() >= UTXO_REFRESH_SECS
+                        && local_runway < refresh_low_watermark)
+                {
                     let mut fresh = fetch_spendable_utxos(&client0, address.clone(), coinbase_maturity).await?;
                     // exclude anything already reserved/pending or already spent
                     fresh.retain(|(op, _)| !pending.contains_key(op) && !spent.contains(op));

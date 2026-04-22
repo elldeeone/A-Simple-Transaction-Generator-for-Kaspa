@@ -65,6 +65,8 @@ For custom devnets, two extra runtime overrides are useful:
 
 * `--rpc-url <grpc://host:port>` to target a non-default devnet RPC endpoint
 * `--coinbase-maturity <daa-score>` when your devnet blockrate override changes the effective maturity window
+* `--rpc-timeout-ms <ms>` to keep live submit calls on a short timeout
+* `--startup-rpc-timeout-ms <ms>` to allow slower large-wallet inventory scans without slowing the spam path
 
 On current stock networks, mainnet, testnet-10, and devnet all run at 10 BPS, so the default coinbase maturity is `1000` DAA.
 
@@ -122,7 +124,11 @@ On current stock networks, mainnet, testnet-10, and devnet all run at 10 BPS, so
    cargo run --release --bin Tx_gen -- --net devnet --coinbase-maturity 2000
    ```
 
-   If the node is not on the same host, also pass `--rpc-url`.
+   If the node is not on the same host, also pass `--rpc-url`. For very large devnet wallets, it can also help to give the startup inventory scan a longer timeout without changing the live submit timeout:
+
+   ```bash
+   cargo run --release --bin Tx_gen -- --net devnet --rpc-url grpc://10.0.4.30:16610 --coinbase-maturity 2000 --startup-rpc-timeout-ms 60000
+   ```
 
 7. **Run on mainnet** (only if you know what you are doing)
 
@@ -144,6 +150,13 @@ On current stock networks, mainnet, testnet-10, and devnet all run at 10 BPS, so
 ## Tuning knobs
 
 These are the top constants in the script, with plain-English descriptions. Adjust before building.
+
+There are also a few runtime flags that are better left as CLI overrides than hardcoded constants:
+
+* `--rpc-url <grpc://host:port>`
+* `--coinbase-maturity <daa-score>`
+* `--rpc-timeout-ms <ms>`
+* `--startup-rpc-timeout-ms <ms>`
 
 | Constant                  |    Type | Meaning                                                                                                                              |
 | ------------------------- | ------: | ------------------------------------------------------------------------------------------------------------------------------------ |
@@ -198,7 +211,7 @@ You can raise fee rates if your node rejects for size or fee reasons.
 4. **Send loop**
 
    * Computes a fractional target per tick based on `TARGET_TPS` and `MILLIS_PER_TICK`.
-   * Refreshes UTXOs regularly and when low.
+   * Refreshes UTXOs when the local ready pool is running low, instead of repeatedly rescanning very large wallets during steady-state spam.
    * Builds 1-in 1-out signed transactions in parallel.
    * Maintains a large async inflight queue with round-robin client selection.
    * Prints per-second TPS and a rolling 10-second average.
@@ -222,5 +235,4 @@ You can raise fee rates if your node rejects for size or fee reasons.
 * Built on the `rusty-kaspa` stack.
 
 ---
-
 
