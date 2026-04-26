@@ -21,7 +21,7 @@ use kaspa_rpc_core::{
 use kaspa_txscript::pay_to_address_script;
 use secp256k1::{Keypair, SecretKey, SECP256K1};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     str::FromStr,
     sync::Arc,
@@ -50,10 +50,13 @@ const MILLIS_PER_TICK: u64 = 10; // 10 ms tick for smooth pacing
 const BASE_FEE_RATE: u64 = 1; // 1 sompi/gram
 const CLIENT_POOL_SIZE: usize = 8; // gRPC connections
 const UTXO_REFRESH_SECS: u64 = 1;
+const DEFAULT_MAX_INFLIGHT: usize = 20_000;
 const DEFAULT_RPC_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_STARTUP_RPC_TIMEOUT_MS: u64 = DEFAULT_RPC_TIMEOUT_MS;
 const MIN_CHANGE_SOMPI: u64 = 1_000_000; // 0.01 KAS
-const MAX_PENDING_AGE_SECS: u64 = 3600;
+const DEFAULT_PENDING_TTL_SECS: u64 = 60;
+const DEFAULT_RECENT_SPENT_TTL_SECS: u64 = 600;
+const DEFAULT_MAX_RECENT_SPENT: usize = 5_000_000;
 
 // ----------------------- fee helpers -----------------------
 #[allow(unused_variables)]
@@ -149,6 +152,89 @@ fn arg_u64(flag: &str) -> Option<u64> {
     arg_value(flag).and_then(|value| value.parse::<u64>().ok())
 }
 
+fn arg_usize(flag: &str) -> Option<usize> {
+    arg_value(flag).and_then(|value| value.parse::<usize>().ok())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpamOptions {
+    target_tps: u64,
+    duration_seconds: u64,
+    max_inflight: usize,
+    mempool_high_watermark: Option<u64>,
+    mempool_resume_watermark: u64,
+    timeout_cooldown_ms: u64,
+    timeout_cooldown_threshold: u64,
+    pending_ttl_secs: u64,
+    recent_spent_ttl_secs: u64,
+    max_recent_spent: usize,
+}
+
+impl SpamOptions {
+    fn from_args(rpc_timeout_ms: u64) -> Result<Self, Box<dyn std::error::Error>> {
+        let target_tps = arg_u64("--tps").unwrap_or(TARGET_TPS);
+        let duration_seconds = arg_u64("--duration-seconds").unwrap_or(SPAM_DURATION_SECONDS);
+        let max_inflight = arg_usize("--max-inflight").unwrap_or(DEFAULT_MAX_INFLIGHT);
+        let mempool_high_watermark = arg_u64("--mempool-high-watermark");
+        let mempool_resume_watermark = arg_u64("--mempool-resume-watermark").unwrap_or_else(|| {
+            mempool_high_watermark.map(|high| high.saturating_mul(8) / 10).unwrap_or(0)
+        });
+        let timeout_cooldown_ms = arg_u64("--timeout-cooldown-ms").unwrap_or(0);
+        let timeout_cooldown_threshold = arg_u64("--timeout-cooldown-threshold").unwrap_or(1);
+        let pending_ttl_secs = arg_u64("--pending-ttl-secs").unwrap_or_else(|| {
+            DEFAULT_PENDING_TTL_SECS.max((rpc_timeout_ms / 1000).saturating_mul(4))
+        });
+        let recent_spent_ttl_secs =
+            arg_u64("--recent-spent-ttl-secs").unwrap_or(DEFAULT_RECENT_SPENT_TTL_SECS);
+        let default_max_recent_spent = target_tps
+            .saturating_mul(recent_spent_ttl_secs)
+            .min(DEFAULT_MAX_RECENT_SPENT as u64)
+            .max(max_inflight as u64) as usize;
+        let max_recent_spent =
+            arg_usize("--max-recent-spent").unwrap_or(default_max_recent_spent);
+
+        if target_tps == 0 {
+            return Err("--tps must be greater than 0".into());
+        }
+        if max_inflight == 0 {
+            return Err("--max-inflight must be greater than 0".into());
+        }
+        if timeout_cooldown_threshold == 0 {
+            return Err("--timeout-cooldown-threshold must be greater than 0".into());
+        }
+        if pending_ttl_secs == 0 {
+            return Err("--pending-ttl-secs must be greater than 0".into());
+        }
+        if recent_spent_ttl_secs == 0 {
+            return Err("--recent-spent-ttl-secs must be greater than 0".into());
+        }
+        if max_recent_spent == 0 {
+            return Err("--max-recent-spent must be greater than 0".into());
+        }
+        if let Some(high) = mempool_high_watermark {
+            if high == 0 {
+                return Err("--mempool-high-watermark must be greater than 0".into());
+            }
+            if mempool_resume_watermark >= high {
+                return Err("--mempool-resume-watermark must be lower than --mempool-high-watermark".into());
+            }
+        }
+
+        Ok(Self {
+            target_tps,
+            duration_seconds,
+            max_inflight,
+            mempool_high_watermark,
+            mempool_resume_watermark,
+            timeout_cooldown_ms,
+            timeout_cooldown_threshold,
+            pending_ttl_secs,
+            recent_spent_ttl_secs,
+            max_recent_spent,
+        })
+    }
+}
+
 fn assert_network_matches(
     info: &GetServerInfoResponse,
     net: Net,
@@ -181,12 +267,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(DEFAULT_STARTUP_RPC_TIMEOUT_MS.max(rpc_timeout_ms));
     let coinbase_maturity =
         arg_u64("--coinbase-maturity").unwrap_or_else(|| net.default_coinbase_maturity());
+    let client_pool_size = arg_usize("--client-pool-size").unwrap_or(CLIENT_POOL_SIZE);
+    let spam_options = SpamOptions::from_args(rpc_timeout_ms)?;
 
     if rpc_timeout_ms == 0 {
         return Err("--rpc-timeout-ms must be greater than 0".into());
     }
     if startup_rpc_timeout_ms == 0 {
         return Err("--startup-rpc-timeout-ms must be greater than 0".into());
+    }
+    if client_pool_size == 0 {
+        return Err("--client-pool-size must be greater than 0".into());
     }
 
     let startup_client = Arc::new(
@@ -204,8 +295,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // runtime connection pool
-    let mut clients: Vec<Arc<GrpcClient>> = Vec::with_capacity(CLIENT_POOL_SIZE);
-    for _ in 0..CLIENT_POOL_SIZE {
+    let mut clients: Vec<Arc<GrpcClient>> = Vec::with_capacity(client_pool_size);
+    for _ in 0..client_pool_size {
         clients.push(Arc::new(
             GrpcClient::connect_with_args(
                 NotificationMode::Direct,
@@ -221,7 +312,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let secret_key = SecretKey::from_str(PRIVATE_KEY_HEX)?;
+    let private_key_hex = arg_value("--private-key").unwrap_or_else(|| PRIVATE_KEY_HEX.to_string());
+    if private_key_hex.trim().is_empty() || private_key_hex == "ENTER PRIVATE KEY" {
+        return Err("Set PRIVATE_KEY_HEX or pass --private-key <hex>".into());
+    }
+    let secret_key = SecretKey::from_str(private_key_hex.trim())?;
     let keypair = Keypair::from_secret_key(&SECP256K1, &secret_key);
     let address = Address::new(
         net.prefix(),
@@ -239,6 +334,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("rpc: {}", rpc_url);
     println!("rpc timeout: {}ms", rpc_timeout_ms);
     println!("startup rpc timeout: {}ms", startup_rpc_timeout_ms);
+    println!("target tps: {}", spam_options.target_tps);
+    println!("client pool size: {}", client_pool_size);
+    println!("max inflight: {}", spam_options.max_inflight);
+    if let Some(high) = spam_options.mempool_high_watermark {
+        println!(
+            "mempool backpressure: pause >= {}, resume <= {}",
+            high, spam_options.mempool_resume_watermark
+        );
+    }
+    println!(
+        "recent-spent quarantine: ttl={}s, max={}",
+        spam_options.recent_spent_ttl_secs, spam_options.max_recent_spent
+    );
     println!("address: {}", address);
 
     println!("=== UTXO Analysis ===");
@@ -345,9 +453,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &clients,
         address,
         keypair,
-        TARGET_TPS,
-        SPAM_DURATION_SECONDS,
         coinbase_maturity,
+        spam_options,
     )
     .await?;
     Ok(())
@@ -359,27 +466,34 @@ async fn spam_transactions(
     clients: &[Arc<GrpcClient>],
     address: Address,
     keypair: Keypair,
-    target_tps: u64,
-    duration_seconds: u64,
     coinbase_maturity: u64,
+    options: SpamOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client0 = runtime_client.clone();
     let tps_tx = spawn_tps_logger();
 
     // UTXO state
-    let mut pending: HashMap<TransactionOutpoint, Instant> = HashMap::new(); // in-flight or waiting confirm
-    let mut spent: HashSet<TransactionOutpoint> = HashSet::new(); // successfully accepted by node (may still be unconfirmed)
+    let mut pending: HashMap<TransactionOutpoint, Instant> = HashMap::new();
+    let mut recent_spent: HashSet<TransactionOutpoint> = HashSet::new();
+    let mut recent_spent_order: VecDeque<(TransactionOutpoint, Instant)> = VecDeque::new();
 
     // pacing & stats
     let mut stats_start = Instant::now();
     let mut sent_since_reset = 0u64;
+    let mut failures_since_reset = 0u64;
+    let mut suppressed_since_reset = 0u64;
+    let mut timeouts_since_reset = 0u64;
+    let mut timeout_streak = 0u64;
+    let mut cooldown_until: Option<Instant> = None;
+    let mut mempool_paused = false;
+    let mut last_mempool_size = 0u64;
     let start = Instant::now();
 
     // safety cap (flip UNLEASHED to true once you verify)
     let effective_tps = if UNLEASHED {
-        target_tps
+        options.target_tps
     } else {
-        target_tps.min(100)
+        options.target_tps.min(100)
     };
 
     let mut ticker = interval(Duration::from_millis(MILLIS_PER_TICK));
@@ -404,8 +518,9 @@ async fn spam_transactions(
     let mut carry: f64 = 0.0;
 
     // persistent inflight submit queue (don’t block the tick)
-    const MAX_INFLIGHT: usize = 20_000; // keep a leash on concurrent submits
-    let refresh_low_watermark = TARGET_UTXO_COUNT.saturating_mul(2).max(MAX_INFLIGHT / 4);
+    let refresh_low_watermark = TARGET_UTXO_COUNT
+        .saturating_mul(2)
+        .max(options.max_inflight / 4);
     let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut rr = 0usize; // round-robin across client pool
 
@@ -416,9 +531,26 @@ async fn spam_transactions(
         tokio::select! {
             // pace producer
             _ = ticker.tick() => {
-                if duration_seconds > 0 && start.elapsed().as_secs() >= duration_seconds {
-                    println!("Spam duration completed after {} seconds", duration_seconds);
+                if options.duration_seconds > 0 && start.elapsed().as_secs() >= options.duration_seconds {
+                    println!("Spam duration completed after {} seconds", options.duration_seconds);
                     break;
+                }
+
+                let now = Instant::now();
+                let cooldown_active = cooldown_until.map(|until| now < until).unwrap_or(false);
+                if cooldown_until.map(|until| now >= until).unwrap_or(false) {
+                    cooldown_until = None;
+                }
+                if mempool_paused || cooldown_active {
+                    prune_pending(&mut pending, Duration::from_secs(options.pending_ttl_secs), now);
+                    prune_recent_spent(
+                        &mut recent_spent,
+                        &mut recent_spent_order,
+                        Duration::from_secs(options.recent_spent_ttl_secs),
+                        options.max_recent_spent,
+                        now,
+                    );
+                    continue;
                 }
 
                 // refresh UTXOs periodically or when running low
@@ -430,7 +562,7 @@ async fn spam_transactions(
                 {
                     let mut fresh = fetch_spendable_utxos(&client0, address.clone(), coinbase_maturity).await?;
                     // exclude anything already reserved/pending or already spent
-                    fresh.retain(|(op, _)| !pending.contains_key(op) && !spent.contains(op));
+                    fresh.retain(|(op, _)| !pending.contains_key(op) && !recent_spent.contains(op));
                     utxos = fresh;
                     idx = 0;
                     last_refresh = Instant::now();
@@ -438,7 +570,7 @@ async fn spam_transactions(
                 }
 
                 if idx >= utxos.len() { continue; }
-                if inflight.len() >= MAX_INFLIGHT { continue; }
+                if inflight.len() >= options.max_inflight { continue; }
 
                 // how many we *intend* to add this tick
                 let mut to_add: u64 = (target_per_tick + carry).floor() as u64;
@@ -447,7 +579,7 @@ async fn spam_transactions(
                 // respect available UTXOs and inflight cap
                 to_add = to_add
                     .min((utxos.len() - idx) as u64)
-                    .min((MAX_INFLIGHT - inflight.len()) as u64);
+                    .min((options.max_inflight - inflight.len()) as u64);
 
                 if to_add == 0 { continue; }
 
@@ -470,7 +602,6 @@ async fn spam_transactions(
                     .collect();
 
                 // reserve UTXOs *before* submit so refresh won’t reuse them
-                let now = Instant::now();
                 for (_, op) in &tx_jobs {
                     pending.insert(*op, now);
                 }
@@ -494,44 +625,205 @@ async fn spam_transactions(
                 idx = idx.saturating_add(to_add as usize);
 
                 // prune very old pending just in case
-                let max_age = Duration::from_secs(MAX_PENDING_AGE_SECS);
-                pending.retain(|_, t| Instant::now().duration_since(*t) <= max_age);
+                prune_pending(&mut pending, Duration::from_secs(options.pending_ttl_secs), now);
+                prune_recent_spent(
+                    &mut recent_spent,
+                    &mut recent_spent_order,
+                    Duration::from_secs(options.recent_spent_ttl_secs),
+                    options.max_recent_spent,
+                    now,
+                );
             }
 
             // consume completed submits as they finish (doesn't block ticks)
             Some((res, op)) = inflight.next() => {
                 match res {
                     Ok(_) => {
-                        // success: keep as pending until confirmed; also mark as spent so we never reuse
-                        spent.insert(op);
+                        pending.remove(&op);
+                        remember_recent_spent(&mut recent_spent, &mut recent_spent_order, op, Instant::now());
                         sent_since_reset += 1;
+                        timeout_streak = 0;
                         let _ = tps_tx.send(1);
                     }
                     Err(e) => {
-                        // failure: free the UTXO so it can be retried in a refresh
                         pending.remove(&op);
-                        println!("Submit failed: {e}");
+                        failures_since_reset += 1;
+                        let error_text = e.to_string();
+                        let kind = classify_submit_error(&error_text);
+                        if kind.should_quarantine() {
+                            remember_recent_spent(&mut recent_spent, &mut recent_spent_order, op, Instant::now());
+                        }
+                        if kind == SubmitErrorKind::Timeout {
+                            timeouts_since_reset += 1;
+                            timeout_streak += 1;
+                            if options.timeout_cooldown_ms > 0
+                                && timeout_streak >= options.timeout_cooldown_threshold
+                            {
+                                cooldown_until = Some(
+                                    Instant::now()
+                                        + Duration::from_millis(options.timeout_cooldown_ms),
+                                );
+                                timeout_streak = 0;
+                            }
+                        } else {
+                            timeout_streak = 0;
+                        }
+                        if kind.should_suppress() {
+                            suppressed_since_reset += 1;
+                        } else {
+                            println!("Submit failed ({}): {error_text}", kind.as_str());
+                        }
                     }
                 }
             }
 
             // once per second print stats
             _ = stats_ticker.tick() => {
-                let mem = client0.get_info().await.map(|i| i.mempool_size).unwrap_or(0);
+                let mem = client0.get_info().await.map(|i| i.mempool_size).unwrap_or(last_mempool_size);
+                last_mempool_size = mem;
+                if let Some(high) = options.mempool_high_watermark {
+                    if !mempool_paused && mem >= high {
+                        mempool_paused = true;
+                        println!("Mempool high watermark reached: {mem} >= {high}; pausing submit producer");
+                    } else if mempool_paused && mem <= options.mempool_resume_watermark {
+                        mempool_paused = false;
+                        println!(
+                            "Mempool resume watermark reached: {mem} <= {}; resuming submit producer",
+                            options.mempool_resume_watermark
+                        );
+                    }
+                }
+                let now = Instant::now();
+                prune_pending(&mut pending, Duration::from_secs(options.pending_ttl_secs), now);
+                prune_recent_spent(
+                    &mut recent_spent,
+                    &mut recent_spent_order,
+                    Duration::from_secs(options.recent_spent_ttl_secs),
+                    options.max_recent_spent,
+                    now,
+                );
                 let secs = stats_start.elapsed().as_secs_f64();
                 let tps = if secs > 0.0 { sent_since_reset as f64 / secs } else { 0.0 };
+                let cooldown_active = cooldown_until.map(|until| now < until).unwrap_or(false);
+                let gate = if mempool_paused {
+                    "mempool-paused"
+                } else if cooldown_active {
+                    "timeout-cooldown"
+                } else {
+                    "open"
+                };
                 println!(
-                    "TPS (1s avg): {:.1} | sent: {} | mempool(node): {} | inflight: {} | local-pending: {} | UTXOs left: {} | runtime: {}s",
-                    tps, sent_since_reset, mem, inflight.len(), pending.len(),
-                    utxos.len().saturating_sub(idx), start.elapsed().as_secs()
+                    "TPS (1s avg): {:.1} | sent: {} | mempool(node): {} | gate: {} | inflight: {} | local-pending: {} | recent-spent: {} | UTXOs left: {} | failures: {} | suppressed: {} | timeouts: {} | runtime: {}s",
+                    tps, sent_since_reset, mem, gate, inflight.len(), pending.len(),
+                    recent_spent.len(), utxos.len().saturating_sub(idx), failures_since_reset,
+                    suppressed_since_reset, timeouts_since_reset, start.elapsed().as_secs()
                 );
                 stats_start = Instant::now();
                 sent_since_reset = 0;
+                failures_since_reset = 0;
+                suppressed_since_reset = 0;
+                timeouts_since_reset = 0;
             }
         }
     }
 
     Ok(())
+}
+
+fn remember_recent_spent(
+    recent_spent: &mut HashSet<TransactionOutpoint>,
+    recent_spent_order: &mut VecDeque<(TransactionOutpoint, Instant)>,
+    op: TransactionOutpoint,
+    now: Instant,
+) {
+    if recent_spent.insert(op) {
+        recent_spent_order.push_back((op, now));
+    }
+}
+
+fn prune_pending(
+    pending: &mut HashMap<TransactionOutpoint, Instant>,
+    ttl: Duration,
+    now: Instant,
+) {
+    pending.retain(|_, t| now.duration_since(*t) <= ttl);
+}
+
+fn prune_recent_spent(
+    recent_spent: &mut HashSet<TransactionOutpoint>,
+    recent_spent_order: &mut VecDeque<(TransactionOutpoint, Instant)>,
+    ttl: Duration,
+    max_len: usize,
+    now: Instant,
+) {
+    while let Some((op, inserted_at)) = recent_spent_order.front().copied() {
+        if now.duration_since(inserted_at) <= ttl && recent_spent.len() <= max_len {
+            break;
+        }
+        recent_spent_order.pop_front();
+        recent_spent.remove(&op);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitErrorKind {
+    Timeout,
+    Orphan,
+    AlreadyAccepted,
+    DoubleSpend,
+    NotConnected,
+    Other,
+}
+
+impl SubmitErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SubmitErrorKind::Timeout => "timeout",
+            SubmitErrorKind::Orphan => "orphan",
+            SubmitErrorKind::AlreadyAccepted => "already-accepted",
+            SubmitErrorKind::DoubleSpend => "double-spend",
+            SubmitErrorKind::NotConnected => "not-connected",
+            SubmitErrorKind::Other => "other",
+        }
+    }
+
+    fn should_quarantine(self) -> bool {
+        matches!(
+            self,
+            SubmitErrorKind::Timeout
+                | SubmitErrorKind::Orphan
+                | SubmitErrorKind::AlreadyAccepted
+                | SubmitErrorKind::DoubleSpend
+        )
+    }
+
+    fn should_suppress(self) -> bool {
+        matches!(
+            self,
+            SubmitErrorKind::Timeout
+                | SubmitErrorKind::Orphan
+                | SubmitErrorKind::AlreadyAccepted
+                | SubmitErrorKind::DoubleSpend
+                | SubmitErrorKind::NotConnected
+        )
+    }
+}
+
+fn classify_submit_error(error_text: &str) -> SubmitErrorKind {
+    let error = error_text.to_ascii_lowercase();
+    if error.contains("timeout") || error.contains("deadline") {
+        SubmitErrorKind::Timeout
+    } else if error.contains("orphan") {
+        SubmitErrorKind::Orphan
+    } else if error.contains("already") || error.contains("duplicate") {
+        SubmitErrorKind::AlreadyAccepted
+    } else if error.contains("double") || error.contains("spent") {
+        SubmitErrorKind::DoubleSpend
+    } else if error.contains("not connected") || error.contains("connection") {
+        SubmitErrorKind::NotConnected
+    } else {
+        SubmitErrorKind::Other
+    }
 }
 
 // ----------------------- tx builders -----------------------
